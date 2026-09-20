@@ -1,27 +1,24 @@
 package main
 
 import (
-	crypto_rand "crypto/rand"
-	"encoding/binary"
 	"flag"
 	"fmt"
-	"math/rand"
 	"os"
+	"os/signal"
 	"runtime"
-	"sync"
+	"syscall"
 
 	"github.com/jedisct1/dlog"
 	"github.com/kardianos/service"
 )
 
 const (
-	AppVersion            = "2.1.14"
+	AppVersion            = "2.1.18"
 	DefaultConfigFileName = "dnscrypt-proxy.toml"
 )
 
 type App struct {
-	wg    sync.WaitGroup
-	quit  chan struct{}
+	quit  chan os.Signal
 	proxy *Proxy
 	flags *ConfigFlags
 }
@@ -33,15 +30,6 @@ func main() {
 		dlog.Warnf("Timezone setup failed: [%v]", tzErr)
 	}
 	runtime.MemProfileRate = 0
-
-	// Initialize random number generator
-	// Note: As of Go 1.20, the global RNG is automatically seeded
-	// This explicit seeding is kept for compatibility with older Go versions
-	seed := make([]byte, 8)
-	if _, err := crypto_rand.Read(seed); err != nil {
-		dlog.Fatal(err)
-	}
-	rand.Seed(int64(binary.LittleEndian.Uint64(seed)))
 
 	pwd, err := os.Getwd()
 	if err != nil {
@@ -77,12 +65,15 @@ func main() {
 		flags: &flags,
 	}
 
+	svcOptions := make(service.KeyValue)
+	svcOptions["ReloadSignal"] = "HUP"
 	svcConfig := &service.Config{
 		Name:             "dnscrypt-proxy",
 		DisplayName:      "DNSCrypt client proxy",
 		Description:      "Encrypted/authenticated DNS proxy",
 		WorkingDirectory: pwd,
 		Arguments:        []string{"-config", *flags.ConfigFile},
+		Option:           svcOptions,
 	}
 	svc, err := service.New(app, svcConfig)
 	if err != nil {
@@ -117,18 +108,17 @@ func main() {
 			dlog.Fatal(err)
 		}
 	} else {
-		app.Start(nil)
+		app.quit = make(chan os.Signal, 1)
+		signal.Notify(app.quit, os.Interrupt, syscall.SIGTERM)
+		// Possible to exit while initializing
+		go app.AppMain()
+		<-app.quit
+		dlog.Notice("Quit signal received...")
 	}
 }
 
 func (app *App) Start(service service.Service) error {
-	if service != nil {
-		go func() {
-			app.AppMain()
-		}()
-	} else {
-		app.AppMain()
-	}
+	go app.AppMain()
 	return nil
 }
 
@@ -146,16 +136,14 @@ func (app *App) AppMain() {
 	if err := app.proxy.InitHotReload(); err != nil {
 		dlog.Warnf("Failed to initialize hot-reloading: %v", err)
 	}
-	app.quit = make(chan struct{})
-	app.wg.Add(1)
 	app.proxy.StartProxy()
 	runtime.GC()
-	<-app.quit
-	dlog.Notice("Quit signal received...")
-	app.wg.Done()
 }
 
 func (app *App) Stop(service service.Service) error {
+	if app.proxy != nil && app.proxy.udpConnPool != nil {
+		app.proxy.udpConnPool.Close()
+	}
 	if err := PidFileRemove(); err != nil {
 		dlog.Warnf("Failed to remove the PID file: [%v]", err)
 	}

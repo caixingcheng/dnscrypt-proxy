@@ -124,7 +124,7 @@ func (source *Source) updateCache(bin, sig []byte) {
 	now := getCurrentTime()
 	file := source.cacheFile
 	absPath := file
-	if resolved, err := filepath.Abs(file); err != nil {
+	if resolved, err := filepath.Abs(file); err == nil {
 		absPath = resolved
 	}
 
@@ -177,12 +177,16 @@ func (source *Source) fetchWithCache(xTransport *XTransport) (time.Duration, err
 		return 0, err
 	}
 	if ttl > 0 {
+		source.Lock()
 		source.refresh = now.Add(ttl)
+		source.Unlock()
 		return 0, err
 	}
 
 	ttl = MinimumPrefetchInterval
+	source.Lock()
 	source.refresh = now.Add(ttl)
+	source.Unlock()
 	var bin, sig []byte
 	for _, srcURL := range source.urls {
 		dlog.Infof("Source [%s] loading from URL [%s]", source.name, srcURL)
@@ -208,7 +212,9 @@ func (source *Source) fetchWithCache(xTransport *XTransport) (time.Duration, err
 	}
 	source.updateCache(bin, sig)
 	ttl = source.prefetchDelay
+	source.Lock()
 	source.refresh = now.Add(ttl)
+	source.Unlock()
 	return ttl, nil
 }
 
@@ -221,17 +227,24 @@ func NewSource(
 	cacheFile string,
 	formatStr string,
 	refreshDelay time.Duration,
+	cacheTTL time.Duration,
 	prefix string,
 ) (*Source, error) {
 	if refreshDelay < DefaultPrefetchDelay {
 		refreshDelay = DefaultPrefetchDelay
 	}
+	if cacheTTL < refreshDelay {
+		cacheTTL = refreshDelay
+	}
+	if cacheTTL > 168*time.Hour {
+		cacheTTL = 168 * time.Hour
+	}
 	source := &Source{
 		name:          name,
 		urls:          []*url.URL{},
 		cacheFile:     cacheFile,
-		cacheTTL:      refreshDelay,
-		prefetchDelay: DefaultPrefetchDelay,
+		cacheTTL:      cacheTTL,
+		prefetchDelay: refreshDelay,
 		prefix:        prefix,
 	}
 	if formatStr == "v2" {
@@ -257,7 +270,10 @@ func PrefetchSources(xTransport *XTransport, sources []*Source) time.Duration {
 	now := getCurrentTime()
 	interval := MinimumPrefetchInterval
 	for _, source := range sources {
-		if source.refresh.IsZero() || source.refresh.After(now) {
+		source.RLock()
+		refresh := source.refresh
+		source.RUnlock()
+		if refresh.IsZero() || refresh.After(now) {
 			continue
 		}
 		dlog.Debugf("Prefetching [%s]", source.name)
@@ -284,7 +300,7 @@ func (source *Source) Parse() ([]RegisteredServer, error) {
 func (source *Source) parseV2() ([]RegisteredServer, error) {
 	var registeredServers []RegisteredServer
 	var stampErrs []string
-	appendStampErr := func(format string, a ...interface{}) {
+	appendStampErr := func(format string, a ...any) {
 		stampErr := fmt.Sprintf(format, a...)
 		stampErrs = append(stampErrs, stampErr)
 		dlog.Warn(stampErr)

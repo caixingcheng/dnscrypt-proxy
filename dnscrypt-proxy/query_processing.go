@@ -5,10 +5,9 @@ import (
 	"net"
 	"time"
 
+	"codeberg.org/miekg/dns"
 	"github.com/jedisct1/dlog"
-	clocksmith "github.com/jedisct1/go-clocksmith"
 	stamps "github.com/jedisct1/go-dnsstamps"
-	"github.com/miekg/dns"
 )
 
 // validateQuery - Performs basic validation on the incoming query
@@ -24,16 +23,15 @@ func validateQuery(query []byte) bool {
 
 // handleSynthesizedResponse - Handles a synthesized DNS response from plugins
 func handleSynthesizedResponse(pluginsState *PluginsState, synth *dns.Msg) ([]byte, error) {
-	var response []byte
-	var err error
-
-	response, err = synth.PackBuffer(response)
-	if err != nil {
+	if err := validateResponseForQuery(pluginsState.questionMsg, synth); err != nil {
 		pluginsState.returnCode = PluginsReturnCodeParseError
-		// We can't access proxy from pluginsState directly, but the caller will handle logging
+		return nil, err
 	}
-
-	return response, err
+	if err := synth.Pack(); err != nil {
+		pluginsState.returnCode = PluginsReturnCodeParseError
+		return nil, err
+	}
+	return synth.Data, nil
 }
 
 // processDNSCryptQuery - Processes a query using the DNSCrypt protocol
@@ -44,11 +42,11 @@ func processDNSCryptQuery(
 	query []byte,
 	serverProto string,
 ) ([]byte, error) {
-	sharedKey, encryptedQuery, clientNonce, err := proxy.Encrypt(serverInfo, query, serverProto)
+	sharedKey, encryptedQuery, clientNonce, queryEpoch, err := proxy.Encrypt(serverInfo, query, serverProto)
 	if err != nil && serverProto == "udp" {
 		dlog.Debug("Unable to pad for UDP, re-encrypting query for TCP")
 		serverProto = "tcp"
-		sharedKey, encryptedQuery, clientNonce, err = proxy.Encrypt(serverInfo, query, serverProto)
+		sharedKey, encryptedQuery, clientNonce, queryEpoch, err = proxy.Encrypt(serverInfo, query, serverProto)
 	}
 
 	if err != nil {
@@ -61,7 +59,7 @@ func processDNSCryptQuery(
 	var response []byte
 
 	if serverProto == "udp" {
-		response, err = proxy.exchangeWithUDPServer(serverInfo, sharedKey, encryptedQuery, clientNonce)
+		response, err = proxy.exchangeWithUDPServer(serverInfo, sharedKey, encryptedQuery, clientNonce, queryEpoch)
 		retryOverTCP := false
 		if err == nil && len(response) >= MinDNSPacketSize && response[2]&0x02 == 0x02 {
 			retryOverTCP = true
@@ -71,35 +69,36 @@ func processDNSCryptQuery(
 		}
 		if retryOverTCP {
 			serverProto = "tcp"
-			sharedKey, encryptedQuery, clientNonce, err = proxy.Encrypt(serverInfo, query, serverProto)
+			sharedKey, encryptedQuery, clientNonce, queryEpoch, err = proxy.Encrypt(serverInfo, query, serverProto)
 			if err != nil {
 				pluginsState.returnCode = PluginsReturnCodeParseError
 				pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+				serverInfo.noticeFailure(proxy)
 				return nil, err
 			}
-			response, err = proxy.exchangeWithTCPServer(serverInfo, sharedKey, encryptedQuery, clientNonce)
+			response, err = proxy.exchangeWithTCPServer(serverInfo, sharedKey, encryptedQuery, clientNonce, queryEpoch)
 		}
 	} else {
-		response, err = proxy.exchangeWithTCPServer(serverInfo, sharedKey, encryptedQuery, clientNonce)
+		response, err = proxy.exchangeWithTCPServer(serverInfo, sharedKey, encryptedQuery, clientNonce, queryEpoch)
 	}
 
 	// Check for stale response if there was an error
 	if err != nil {
 		if stale, ok := pluginsState.sessionData["stale"]; ok {
 			dlog.Debug("Serving stale response")
-			response, err = (stale.(*dns.Msg)).Pack()
+			staleMsg := stale.(*dns.Msg)
+			if packErr := staleMsg.Pack(); packErr == nil {
+				return staleMsg.Data, nil
+			}
 		}
-	}
-
-	// Handle error cases
-	if err != nil {
+		// No stale response available; this is a definitive failure
+		serverInfo.noticeFailure(proxy)
 		if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
 			pluginsState.returnCode = PluginsReturnCodeServerTimeout
 		} else {
 			pluginsState.returnCode = PluginsReturnCodeNetworkError
 		}
 		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-		serverInfo.noticeFailure(proxy)
 		return nil, err
 	}
 
@@ -119,29 +118,51 @@ func processDoHQuery(
 	serverResponse, _, tls, _, err := proxy.xTransport.DoHQuery(serverInfo.useGet, serverInfo.URL, query, proxy.timeout)
 	SetTransactionID(query, tid)
 
-	// Check for stale response if there was an error
-	if err != nil || tls == nil || !tls.HandshakeComplete {
-		if stale, ok := pluginsState.sessionData["stale"]; ok {
-			dlog.Debug("Serving stale response")
-			return (stale.(*dns.Msg)).Pack()
+	// A response was received, and the TLS handshake was complete.
+	if err == nil && tls != nil && tls.HandshakeComplete {
+		// Restore the original transaction ID
+		response := serverResponse
+		if len(response) >= MinDNSPacketSize {
+			SetTransactionID(response, tid)
+		}
+		return response, nil
+	}
+
+	// Attempt to serve a stale response as a fallback.
+	if stale, ok := pluginsState.sessionData["stale"]; ok {
+		dlog.Debug("Serving stale response")
+		staleMsg := stale.(*dns.Msg)
+		if packErr := staleMsg.Pack(); packErr == nil {
+			return staleMsg.Data, nil
 		}
 	}
 
-	// Handle error cases
-	if err != nil {
-		pluginsState.returnCode = PluginsReturnCodeNetworkError
-		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+	// No stale response available; this is a definitive failure
+	serverInfo.noticeFailure(proxy)
+	pluginsState.returnCode = PluginsReturnCodeNetworkError
+	pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+	return nil, err
+}
+
+// refreshODoHKey claims the per-server refresh slot, drives the actual
+// refresh, and releases the slot under defer so a panic in refreshServer
+// cannot leak the in-flight flag. It returns the refresh error so the
+// caller can propagate it the way the original 401 handler did.
+func refreshODoHKey(proxy *Proxy, serverInfo *ServerInfo, stamp stamps.ServerStamp) error {
+	if !proxy.serversInfo.beginODoHRefresh(serverInfo.Name, 10*time.Second) {
+		dlog.Debugf("Skipping key update for [%v] (refresh in flight or recently failed)", serverInfo.Name)
+		return nil
+	}
+	success := false
+	defer func() { proxy.serversInfo.endODoHRefresh(serverInfo.Name, success) }()
+	dlog.Infof("Forcing key update for [%v]", serverInfo.Name)
+	if err := proxy.serversInfo.refreshServer(proxy, serverInfo.Name, stamp); err != nil {
+		dlog.Noticef("Key update failed for [%v]", serverInfo.Name)
 		serverInfo.noticeFailure(proxy)
-		return nil, err
+		return err
 	}
-
-	// Restore the original transaction ID
-	response := serverResponse
-	if len(response) >= MinDNSPacketSize {
-		SetTransactionID(response, tid)
-	}
-
-	return response, nil
+	success = true
+	return nil
 }
 
 // processODoHQuery - Processes a query using the ODoH protocol
@@ -156,6 +177,8 @@ func processODoHQuery(
 		return nil, nil
 	}
 
+	serverInfo.noticeBegin(proxy)
+
 	target := serverInfo.odohTargetConfigs[rand.Intn(len(serverInfo.odohTargetConfigs))]
 	odohQuery, err := target.encryptQuery(query)
 	if err != nil {
@@ -169,12 +192,14 @@ func processODoHQuery(
 	}
 
 	responseBody, responseCode, _, _, err := proxy.xTransport.ObliviousDoHQuery(
-		serverInfo.useGet, targetURL, odohQuery.odohMessage, proxy.timeout)
+		serverInfo.useGet, targetURL, odohQuery.odohMessage, proxy.timeout,
+	)
 
 	if err == nil && len(responseBody) > 0 && responseCode == 200 {
 		response, err := odohQuery.decryptResponse(responseBody)
 		if err != nil {
 			dlog.Warnf("Failed to decrypt response from [%v]", serverInfo.Name)
+			serverInfo.noticeFailure(proxy)
 			return nil, err
 		}
 
@@ -185,23 +210,52 @@ func processODoHQuery(
 
 		return response, nil
 	} else if responseCode == 401 || (responseCode == 200 && len(responseBody) == 0) {
+		dlog.Warnf(
+			"ODoH request for [%v] needs a key refresh via [%v]: HTTP status [%d], response length: %d, transport error: [%v]",
+			serverInfo.Name,
+			targetURL,
+			responseCode,
+			len(responseBody),
+			err,
+		)
 		if responseCode == 200 {
 			dlog.Warnf("ODoH relay for [%v] is buggy and returns a 200 status code instead of 401 after a key update", serverInfo.Name)
 		}
 
-		dlog.Infof("Forcing key update for [%v]", serverInfo.Name)
+		var stamp stamps.ServerStamp
+		matched := false
+		proxy.serversInfo.RLock()
 		for _, registeredServer := range proxy.serversInfo.registeredServers {
 			if registeredServer.name == serverInfo.Name {
-				if err = proxy.serversInfo.refreshServer(proxy, registeredServer.name, registeredServer.stamp); err != nil {
-					dlog.Noticef("Key update failed for [%v]", serverInfo.Name)
-					serverInfo.noticeFailure(proxy)
-					clocksmith.Sleep(10 * time.Second)
-				}
+				stamp = registeredServer.stamp
+				matched = true
 				break
 			}
 		}
+		proxy.serversInfo.RUnlock()
+		if matched {
+			if refreshErr := refreshODoHKey(proxy, serverInfo, stamp); refreshErr != nil {
+				err = refreshErr
+			}
+		}
 	} else {
-		dlog.Warnf("Failed to receive successful response from [%v]", serverInfo.Name)
+		if err != nil {
+			dlog.Warnf(
+				"ODoH request for [%v] failed via [%v]: HTTP status [%d], transport error: [%v]",
+				serverInfo.Name,
+				targetURL,
+				responseCode,
+				err,
+			)
+		} else {
+			dlog.Warnf(
+				"ODoH request for [%v] failed via [%v]: HTTP status [%d], response length: %d",
+				serverInfo.Name,
+				targetURL,
+				responseCode,
+				len(responseBody),
+			)
+		}
 	}
 
 	pluginsState.returnCode = PluginsReturnCodeNetworkError
@@ -254,10 +308,9 @@ func processPlugins(
 	serverInfo *ServerInfo,
 	response []byte,
 ) ([]byte, error) {
-	var ttl *uint32
 	var err error
 
-	response, err = pluginsState.ApplyResponsePlugins(&proxy.pluginsGlobals, response, ttl)
+	response, err = pluginsState.ApplyResponsePlugins(&proxy.pluginsGlobals, response)
 	if err != nil {
 		pluginsState.returnCode = PluginsReturnCodeParseError
 		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
@@ -272,9 +325,8 @@ func processPlugins(
 	}
 
 	if pluginsState.synthResponse != nil {
-		response, err = pluginsState.synthResponse.PackBuffer(response)
+		response, err = handleSynthesizedResponse(pluginsState, pluginsState.synthResponse)
 		if err != nil {
-			pluginsState.returnCode = PluginsReturnCodeParseError
 			pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 			return response, err
 		}
@@ -349,15 +401,8 @@ func updateMonitoringMetrics(
 	pluginsState *PluginsState,
 ) {
 	if proxy.monitoringUI.Enabled && proxy.monitoringInstance != nil && pluginsState.questionMsg != nil {
-		dlog.Debugf("Calling UpdateMetrics for query: %s", pluginsState.qName)
 		proxy.monitoringInstance.UpdateMetrics(*pluginsState, pluginsState.questionMsg)
 	} else {
-		if !proxy.monitoringUI.Enabled {
-			dlog.Debugf("Monitoring UI not enabled")
-		}
-		if proxy.monitoringInstance == nil {
-			dlog.Debugf("Monitoring instance is nil")
-		}
 		if pluginsState.questionMsg == nil {
 			dlog.Debugf("Question message is nil")
 		}

@@ -79,6 +79,9 @@ func parseODoHTargetConfigs(configs []byte) ([]ODoHTargetConfig, error) {
 		}
 		configVersion := binary.BigEndian.Uint16(configs[offset : offset+2])
 		configLength := binary.BigEndian.Uint16(configs[offset+2 : offset+4])
+		if offset+4+int(configLength) > len(configs) {
+			break
+		}
 		if configVersion == odohVersion || configVersion == odohTestVersion {
 			if configVersion != odohVersion {
 				dlog.Debugf("Server still uses the legacy 0x%x ODoH version", configVersion)
@@ -177,11 +180,22 @@ func (q ODoHQuery) decryptResponse(response []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(responsePlaintext) < 2 {
+		return nil, fmt.Errorf("Malformed response")
+	}
 
 	responseLength := binary.BigEndian.Uint16(responsePlaintext[0:2])
+	paddingOffset := 2 + int(responseLength)
+	if paddingOffset+2 > len(responsePlaintext) {
+		return nil, fmt.Errorf("Malformed response")
+	}
+	paddingLength := int(binary.BigEndian.Uint16(responsePlaintext[paddingOffset : paddingOffset+2]))
+	if paddingOffset+2+paddingLength != len(responsePlaintext) {
+		return nil, fmt.Errorf("Malformed response")
+	}
 	valid := 1
-	for i := 4 + int(responseLength); i < len(responsePlaintext); i++ {
-		valid &= subtle.ConstantTimeByteEq(response[i], 0x00)
+	for i := paddingOffset + 2; i < len(responsePlaintext); i++ {
+		valid &= subtle.ConstantTimeByteEq(responsePlaintext[i], 0x00)
 	}
 	if valid != 1 {
 		return nil, fmt.Errorf("Malformed response")

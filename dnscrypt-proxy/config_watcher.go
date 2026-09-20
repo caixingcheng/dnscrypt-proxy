@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"errors"
 	"io"
@@ -132,13 +133,13 @@ func (cw *ConfigWatcher) checkFile(wf *WatchedFile) {
 	}
 
 	// If file size or hash is still changing, it's still being written
-	if size1 != size2 || !hashesEqual(hash1, hash2) {
+	if size1 != size2 || !bytes.Equal(hash1, hash2) {
 		dlog.Debugf("File [%s] is still being modified, waiting for stability", wf.path)
 		return
 	}
 
 	// The file appears stable, check if it's different from last loaded version
-	if wf.lastSize == size2 && hashesEqual(wf.lastHash, hash2) {
+	if wf.lastSize == size2 && bytes.Equal(wf.lastHash, hash2) {
 		// Content hasn't changed despite mod time change
 		wf.lastMod = fileInfo.ModTime()
 		return
@@ -201,10 +202,12 @@ func (cw *ConfigWatcher) AddFile(path string, reloadFunc func() error) error {
 	// Add to tracked files
 	cw.watchedFiles[absPath] = wf
 
-	// Watch directory containing the file to catch moves/renames
-	dirPath := filepath.Dir(absPath)
-	if err := cw.watcher.Add(dirPath); err != nil {
-		return err
+	// Watch directory containing the file to catch moves/renames when fsnotify is available
+	if cw.watcher != nil {
+		dirPath := filepath.Dir(absPath)
+		if err := cw.watcher.Add(dirPath); err != nil {
+			return err
+		}
 	}
 
 	dlog.Noticef("Now watching [%s] for changes", absPath)
@@ -293,17 +296,4 @@ func getFileHash(path string) ([]byte, error) {
 	}
 
 	return hash.Sum(nil), nil
-}
-
-// hashesEqual compares two hashes for equality
-func hashesEqual(h1, h2 []byte) bool {
-	if len(h1) != len(h2) {
-		return false
-	}
-	for i := range h1 {
-		if h1[i] != h2[i] {
-			return false
-		}
-	}
-	return true
 }

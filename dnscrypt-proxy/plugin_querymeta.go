@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/miekg/dns"
+	"codeberg.org/miekg/dns"
 )
 
 type PluginQueryMeta struct {
@@ -9,18 +9,17 @@ type PluginQueryMeta struct {
 }
 
 func (plugin *PluginQueryMeta) Name() string {
-	return "query_log"
+	return "query_meta"
 }
 
 func (plugin *PluginQueryMeta) Description() string {
-	return "Log DNS queries."
+	return "Add metadata to outgoing DNS queries."
 }
 
 func (plugin *PluginQueryMeta) Init(proxy *Proxy) error {
 	queryMetaRR := new(dns.TXT)
-	queryMetaRR.Hdr = dns.RR_Header{
-		Name: ".", Rrtype: dns.TypeTXT,
-		Class: dns.ClassINET, Ttl: 86400,
+	queryMetaRR.Hdr = dns.Header{
+		Name: ".", Class: dns.ClassINET, TTL: 86400,
 	}
 	queryMetaRR.Txt = proxy.queryMeta
 	plugin.queryMetaRR = queryMetaRR

@@ -1,16 +1,22 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
+	"codeberg.org/miekg/dns"
 	"github.com/jedisct1/dlog"
 	"github.com/lifenjoiner/dhcpdns"
-	"github.com/miekg/dns"
+	netproxy "golang.org/x/net/proxy"
 )
 
 type SearchSequenceItemType int
@@ -19,22 +25,27 @@ const (
 	Explicit SearchSequenceItemType = iota
 	Bootstrap
 	DHCP
+	Resolvconf
 )
 
 type SearchSequenceItem struct {
-	typ     SearchSequenceItemType
-	servers []string
+	typ        SearchSequenceItemType
+	servers    []string
+	resolvconf string
+	rcLastFail atomic.Int64 // unix timestamp of last failed resolv.conf read
 }
 
 type PluginForwardEntry struct {
 	domain   string
 	sequence []SearchSequenceItem
+	viaProxy bool
 }
 
 type PluginForward struct {
 	forwardMap         []PluginForwardEntry
 	bootstrapResolvers []string
 	dhcpdns            []*dhcpdns.Detector
+	proxyDialer        netproxy.Dialer
 
 	// Hot-reloading support
 	rwLock        sync.RWMutex
@@ -57,6 +68,9 @@ func (plugin *PluginForward) Init(proxy *Proxy) error {
 
 	if proxy.xTransport != nil {
 		plugin.bootstrapResolvers = proxy.xTransport.bootstrapResolvers
+		if proxy.xTransport.proxyDialer != nil {
+			plugin.proxyDialer = *proxy.xTransport.proxyDialer
+		}
 	}
 
 	lines, err := ReadTextFile(plugin.configFile)
@@ -113,8 +127,19 @@ func (plugin *PluginForward) parseForwardFile(lines string) (bool, []PluginForwa
 			)
 		}
 		domain = strings.ToLower(domain)
+		viaProxy := false
+		if strings.HasPrefix(serversStr, "$PROXY:") {
+			viaProxy = true
+			serversStr = strings.TrimSpace(serversStr[len("$PROXY:"):])
+			if plugin.proxyDialer == nil {
+				return false, nil, fmt.Errorf(
+					"Forwarding rule at line %d uses $PROXY:, but no proxy is available. The `proxy` option must be configured in the main configuration file",
+					1+lineNo,
+				)
+			}
+		}
 		var sequence []SearchSequenceItem
-		for _, server := range strings.Split(serversStr, ",") {
+		for server := range strings.SplitSeq(serversStr, ",") {
 			server = strings.TrimSpace(server)
 			switch server {
 			case "$BOOTSTRAP":
@@ -139,6 +164,30 @@ func (plugin *PluginForward) parseForwardFile(lines string) (bool, []PluginForwa
 				}
 				requiresDHCP = true
 			default:
+				const resolvconfPrefix = "$RESOLVCONF:"
+				if strings.HasPrefix(server, resolvconfPrefix) {
+					file := server[len(resolvconfPrefix):]
+					if len(file) == 0 {
+						dlog.Criticalf(
+							"File needs to be specified for $RESOLVCONF in line %d",
+							1+lineNo,
+						)
+						continue
+					}
+					file = filepath.Clean(file)
+					if !filepath.IsAbs(file) {
+						dlog.Warnf(
+							"$RESOLVCONF path '%s' at line %d is not absolute; "+
+								"this may not resolve as expected", file, 1+lineNo,
+						)
+					}
+					sequence = append(sequence, SearchSequenceItem{
+						typ:        Resolvconf,
+						resolvconf: file,
+					})
+					dlog.Infof("Forwarding [%s] to the servers specified in '%s'", domain, file)
+					continue
+				}
 				if strings.HasPrefix(server, "$") {
 					dlog.Criticalf("Unknown keyword [%s] at line %d", server, 1+lineNo)
 					continue
@@ -148,8 +197,8 @@ func (plugin *PluginForward) parseForwardFile(lines string) (bool, []PluginForwa
 					continue
 				} else {
 					idxServers := -1
-					for i, item := range sequence {
-						if item.typ == Explicit {
+					for i := range sequence {
+						if sequence[i].typ == Explicit {
 							idxServers = i
 						}
 					}
@@ -162,9 +211,26 @@ func (plugin *PluginForward) parseForwardFile(lines string) (bool, []PluginForwa
 				}
 			}
 		}
+		if viaProxy {
+			if len(sequence) == 0 {
+				return false, nil, fmt.Errorf(
+					"Syntax error for a forwarding rule at line %d. $PROXY: requires at least one valid server address",
+					1+lineNo,
+				)
+			}
+			for i := range sequence {
+				if sequence[i].typ != Explicit {
+					return false, nil, fmt.Errorf(
+						"Syntax error for a forwarding rule at line %d. $PROXY: can only be combined with explicit server IP addresses",
+						1+lineNo,
+					)
+				}
+			}
+		}
 		forwardMap = append(forwardMap, PluginForwardEntry{
 			domain:   domain,
 			sequence: sequence,
+			viaProxy: viaProxy,
 		})
 	}
 
@@ -193,22 +259,24 @@ func (plugin *PluginForward) PrepareReload() error {
 	}
 
 	// Store in staging area
+	plugin.rwLock.Lock()
 	plugin.stagingMap = stagingMap
+	plugin.rwLock.Unlock()
 
 	return nil
 }
 
 // ApplyReload atomically replaces the active rules with the staging ones
 func (plugin *PluginForward) ApplyReload() error {
+	plugin.rwLock.Lock()
+	defer plugin.rwLock.Unlock()
+
 	if plugin.stagingMap == nil {
 		return errors.New("no staged configuration to apply")
 	}
 
-	// Use write lock to swap rule structures
-	plugin.rwLock.Lock()
 	plugin.forwardMap = plugin.stagingMap
 	plugin.stagingMap = nil
-	plugin.rwLock.Unlock()
 
 	dlog.Noticef("Applied new configuration for plugin [%s]", plugin.Name())
 	return nil
@@ -216,7 +284,9 @@ func (plugin *PluginForward) ApplyReload() error {
 
 // CancelReload cleans up any staging resources
 func (plugin *PluginForward) CancelReload() {
+	plugin.rwLock.Lock()
 	plugin.stagingMap = nil
+	plugin.rwLock.Unlock()
 }
 
 // Reload implements hot-reloading for the plugin
@@ -250,6 +320,7 @@ func (plugin *PluginForward) Eval(pluginsState *PluginsState, msg *dns.Msg) erro
 	// Use read lock for thread-safe access to forwardMap
 	plugin.rwLock.RLock()
 	var sequence []SearchSequenceItem
+	viaProxy := false
 	for _, candidate := range plugin.forwardMap {
 		candidateLen := len(candidate.domain)
 		if candidateLen > qNameLen {
@@ -259,6 +330,7 @@ func (plugin *PluginForward) Eval(pluginsState *PluginsState, msg *dns.Msg) erro
 			(candidateLen == qNameLen || (qName[qNameLen-candidateLen-1] == '.'))) ||
 			(candidate.domain == ".") {
 			sequence = candidate.sequence
+			viaProxy = candidate.viaProxy
 			break
 		}
 	}
@@ -270,11 +342,13 @@ func (plugin *PluginForward) Eval(pluginsState *PluginsState, msg *dns.Msg) erro
 	var err error
 	var respMsg *dns.Msg
 	tries := 4
-	for _, item := range sequence {
+	const resolvconfRetryInterval int64 = 30 // seconds
+
+	for i := range sequence {
 		var server string
-		switch item.typ {
+		switch sequence[i].typ {
 		case Explicit:
-			server = item.servers[rand.Intn(len(item.servers))]
+			server = sequence[i].servers[rand.Intn(len(sequence[i].servers))]
 		case Bootstrap:
 			server = plugin.bootstrapResolvers[rand.Intn(len(plugin.bootstrapResolvers))]
 		case DHCP:
@@ -282,7 +356,7 @@ func (plugin *PluginForward) Eval(pluginsState *PluginsState, msg *dns.Msg) erro
 			for _, dhcpdns := range plugin.dhcpdns {
 				inconsistency, ip, dhcpDNS, err := dhcpdns.Status()
 				if err != nil && ip != "" && inconsistency > maxInconsistency {
-					dlog.Infof("No response from the DHCP server while resolving [%s]", qName)
+					dlog.Infof("No response from the DHCP server while resolving [%s]: %v", qName, err)
 					continue
 				}
 				if len(dhcpDNS) > 0 {
@@ -292,6 +366,41 @@ func (plugin *PluginForward) Eval(pluginsState *PluginsState, msg *dns.Msg) erro
 			}
 			if len(server) == 0 {
 				dlog.Infof("DHCP didn't provide any DNS server to forward [%s]", qName)
+				continue
+			}
+		case Resolvconf:
+			if lastFail := sequence[i].rcLastFail.Load(); lastFail != 0 &&
+				time.Now().Unix()-lastFail < resolvconfRetryInterval {
+				continue
+			}
+			servers, warnings, err := parseResolvConf(sequence[i].resolvconf)
+			if err != nil {
+				dlog.Warnf(
+					"Failed to open '%s' while resolving [%s]: %v",
+					sequence[i].resolvconf, qName, err,
+				)
+				sequence[i].rcLastFail.Store(time.Now().Unix())
+				continue
+			}
+			if len(servers) == 0 {
+				for _, w := range warnings {
+					dlog.Warn(w)
+				}
+				dlog.Warnf(
+					"No valid nameservers in '%s' while resolving [%s]",
+					sequence[i].resolvconf, qName,
+				)
+				sequence[i].rcLastFail.Store(time.Now().Unix())
+				continue
+			}
+			sequence[i].rcLastFail.Store(0) // clear failure state on successful read
+			nameserver := servers[rand.Intn(len(servers))]
+			server, err = normalizeIPAndOptionalPort(nameserver, "53")
+			if err != nil {
+				dlog.Warnf(
+					"Syntax error in address '%s' while resolving [%s]: %v",
+					nameserver, qName, err,
+				)
 				continue
 			}
 		}
@@ -304,28 +413,29 @@ func (plugin *PluginForward) Eval(pluginsState *PluginsState, msg *dns.Msg) erro
 			break
 		}
 		tries--
-		dlog.Debugf("Forwarding [%s] to [%s]", qName, server)
-		client := dns.Client{Net: pluginsState.serverProto, Timeout: pluginsState.timeout}
 
 		// Create a clean copy of the message without Extra section for forwarding
 		forwardMsg := msg.Copy()
 		forwardMsg.Extra = nil
+		forwardMsg.Data = nil // Clear packed data so Exchange will re-pack without Extra
 
-		respMsg, _, err = client.Exchange(forwardMsg, server)
+		if viaProxy {
+			dlog.Debugf("Forwarding [%s] to [%s] using DNS-over-TCP through the configured proxy", qName, server)
+			respMsg, err = plugin.exchangeViaProxy(forwardMsg, server, pluginsState.timeout)
+		} else {
+			dlog.Debugf("Forwarding [%s] to [%s]", qName, server)
+			respMsg, err = plugin.exchangeDirect(forwardMsg, pluginsState.serverProto, server, pluginsState.timeout)
+		}
 		if err != nil {
 			continue
 		}
-		if respMsg.Truncated {
-			client.Net = "tcp"
-			respMsg, _, err = client.Exchange(forwardMsg, server)
-			if err != nil {
-				continue
-			}
+		if err := validateResponseQuestion(forwardMsg, respMsg); err != nil {
+			continue
 		}
-		if edns0 := respMsg.IsEdns0(); edns0 == nil || !edns0.Do() {
+		if !respMsg.Security {
 			respMsg.AuthenticatedData = false
 		}
-		respMsg.Id = msg.Id
+		respMsg.ID = msg.ID
 		pluginsState.synthResponse = respMsg
 		pluginsState.action = PluginsActionSynth
 		pluginsState.returnCode = PluginsReturnCodeForward
@@ -338,6 +448,131 @@ func (plugin *PluginForward) Eval(pluginsState *PluginsState, msg *dns.Msg) erro
 		return nil
 	}
 	return err
+}
+
+// exchangeDirect sends a query to the selected upstream server using the current
+// protocol, retrying a truncated UDP response over TCP.
+func (plugin *PluginForward) exchangeDirect(
+	forwardMsg *dns.Msg,
+	serverProto string,
+	server string,
+	timeout time.Duration,
+) (*dns.Msg, error) {
+	client := dns.Client{}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	respMsg, _, err := client.Exchange(ctx, forwardMsg, serverProto, server)
+	cancel()
+	if err != nil && (respMsg == nil || !respMsg.Truncated) {
+		return nil, err
+	}
+	if respMsg != nil && respMsg.Truncated {
+		ctx, cancel = context.WithTimeout(context.Background(), timeout)
+		respMsg, _, err = client.Exchange(ctx, forwardMsg, "tcp", server)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return respMsg, nil
+}
+
+// deadlineCappedConn caps every deadline set on the underlying connection, so helpers
+// that reset deadlines cannot extend I/O beyond the query timeout.
+type deadlineCappedConn struct {
+	net.Conn
+	deadline time.Time
+}
+
+func (c *deadlineCappedConn) capped(t time.Time) time.Time {
+	if t.IsZero() || t.After(c.deadline) {
+		return c.deadline
+	}
+	return t
+}
+
+func (c *deadlineCappedConn) SetDeadline(t time.Time) error {
+	return c.Conn.SetDeadline(c.capped(t))
+}
+
+func (c *deadlineCappedConn) SetReadDeadline(t time.Time) error {
+	return c.Conn.SetReadDeadline(c.capped(t))
+}
+
+func (c *deadlineCappedConn) SetWriteDeadline(t time.Time) error {
+	return c.Conn.SetWriteDeadline(c.capped(t))
+}
+
+// exchangeViaProxy performs a DNS-over-TCP exchange through the proxy configured with the
+// top-level `proxy` option. The connection is created per query and always closed here.
+func (plugin *PluginForward) exchangeViaProxy(
+	forwardMsg *dns.Msg,
+	server string,
+	timeout time.Duration,
+) (*dns.Msg, error) {
+	if plugin.proxyDialer == nil {
+		return nil, errors.New("proxied forwarding requires the `proxy` option to be configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var conn net.Conn
+	var err error
+	if contextDialer, ok := plugin.proxyDialer.(netproxy.ContextDialer); ok {
+		conn, err = contextDialer.DialContext(ctx, "tcp", server)
+	} else {
+		conn, err = plugin.proxyDialer.Dial("tcp", server)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("unable to reach [%s] through the proxy: %w", server, err)
+	}
+	defer conn.Close()
+	deadline, _ := ctx.Deadline()
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return nil, fmt.Errorf("timeout while connecting to [%s] through the proxy", server)
+	}
+	// ExchangeWithConn dereferences the client transport and replaces the connection's
+	// read and write deadlines with its own timeouts, so the transport must be non-nil
+	// and the wrapper is what keeps the query timeout an end-to-end bound.
+	conn = &deadlineCappedConn{Conn: conn, deadline: deadline}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
+	client := dns.Client{Transport: &dns.Transport{ReadTimeout: remaining, WriteTimeout: remaining}}
+	respMsg, _, err := client.ExchangeWithConn(ctx, forwardMsg, conn)
+	if err != nil {
+		return nil, fmt.Errorf("proxied exchange with [%s] failed: %w", server, err)
+	}
+	return respMsg, nil
+}
+
+func parseResolvConf(filename string) (servers []string, warnings []string, err error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, nil, err
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "nameserver") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		addr := fields[1]
+		host := addr
+		if h, _, err := net.SplitHostPort(addr); err == nil {
+			host = h
+		}
+		if net.ParseIP(host) == nil {
+			warnings = append(warnings, fmt.Sprintf(
+				"Ignoring invalid nameserver address '%s' in [%s]", addr, filename,
+			))
+			continue
+		}
+		servers = append(servers, addr)
+	}
+	return
 }
 
 func normalizeIPAndOptionalPort(addr string, defaultPort string) (string, error) {

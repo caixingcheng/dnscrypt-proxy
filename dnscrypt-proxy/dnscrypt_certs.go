@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"codeberg.org/miekg/dns"
 	"github.com/jedisct1/dlog"
-	"github.com/miekg/dns"
 	"golang.org/x/crypto/ed25519"
 )
 
@@ -18,6 +18,8 @@ type CertInfo struct {
 	MagicQuery         [ClientMagicLen]byte
 	CryptoConstruction CryptoConstruction
 	ForwardSecurity    bool
+	PqPublicKey        []byte
+	PqCertContext      []byte
 }
 
 func FetchCurrentDNSCryptCert(
@@ -40,8 +42,7 @@ func FetchCurrentDNSCryptCert(
 	if serverName == nil {
 		serverName = &providerName
 	}
-	query := dns.Msg{}
-	query.SetQuestion(providerName, dns.TypeTXT)
+	query := dns.NewMsg(providerName, dns.TypeTXT)
 	if !strings.HasPrefix(providerName, "2.dnscrypt-cert.") {
 		if relay != nil && !proxy.anonDirectCertFallback {
 			dlog.Warnf(
@@ -61,7 +62,7 @@ func FetchCurrentDNSCryptCert(
 	in, rtt, fragmentsBlocked, err := DNSExchange(
 		proxy,
 		proto,
-		&query,
+		query,
 		serverAddress,
 		relay,
 		serverName,
@@ -71,6 +72,22 @@ func FetchCurrentDNSCryptCert(
 		dlog.Noticef("[%s] TIMEOUT", *serverName)
 		return CertInfo{}, 0, fragmentsBlocked, err
 	}
+	if in.Truncated && proto != "tcp" {
+		dlog.Debugf("[%v] certificate response was truncated, retrying over TCP", *serverName)
+		if inTCP, _, _, errTCP := DNSExchange(
+			proxy,
+			"tcp",
+			query,
+			serverAddress,
+			relay,
+			serverName,
+			false,
+		); errTCP == nil {
+			// TCP completed the certificate set; the UDP RTT still represents
+			// normal query latency when force_tcp is disabled.
+			in = inTCP
+		}
+	}
 	now := uint32(time.Now().Unix())
 	certInfo := CertInfo{CryptoConstruction: UndefinedConstruction}
 	highestSerial := uint32(0)
@@ -78,7 +95,7 @@ func FetchCurrentDNSCryptCert(
 	for _, answerRr := range in.Answer {
 		var txt string
 		if t, ok := answerRr.(*dns.TXT); !ok {
-			dlog.Noticef("[%v] Extra record of type [%v] found in certificate", *serverName, answerRr.Header().Rrtype)
+			dlog.Noticef("[%v] Extra record of type [%v] found in certificate", *serverName, dns.RRToType(answerRr))
 			continue
 		} else {
 			txt = strings.Join(t.Txt, "")
@@ -99,8 +116,19 @@ func FetchCurrentDNSCryptCert(
 			dlog.Noticef("[%v] should upgrade to XChaCha20 for encryption", *serverName)
 		case 0x0002:
 			cryptoConstruction = XChacha20Poly1305
+		case 0x0003:
+			cryptoConstruction = XWingPQ
 		default:
 			dlog.Debugf("[%v] uses an unsupported encryption system", *serverName)
+			continue
+		}
+		isPQ := cryptoConstruction == XWingPQ
+		if isPQ && !proxy.pqDNSCrypt {
+			dlog.Debugf("[%v] ignoring post-quantum certificate, disabled in the configuration", *serverName)
+			continue
+		}
+		if isPQ && len(binCert) < 1320 {
+			dlog.Warnf("[%v] PQ certificate too short", *serverName)
 			continue
 		}
 		signature := binCert[8:72]
@@ -109,11 +137,22 @@ func FetchCurrentDNSCryptCert(
 			dlog.Warnf("[%v] Incorrect signature for provider name: [%v]", *serverName, providerName)
 			continue
 		}
-		serial := binary.BigEndian.Uint32(binCert[112:116])
-		tsBegin := binary.BigEndian.Uint32(binCert[116:120])
-		tsEnd := binary.BigEndian.Uint32(binCert[120:124])
+		var serialOff, tsBeginOff, tsEndOff int
+		if isPQ {
+			ext := binCert[1308:1320]
+			if !bytes.Equal(ext, pqProfileExtension()) || !bytes.Equal(binCert[4:6], ext[4:6]) {
+				dlog.Warnf("[%v] invalid PQ profile extension", *serverName)
+				continue
+			}
+			serialOff, tsBeginOff, tsEndOff = 1296, 1300, 1304
+		} else {
+			serialOff, tsBeginOff, tsEndOff = 112, 116, 120
+		}
+		serial := binary.BigEndian.Uint32(binCert[serialOff : serialOff+4])
+		tsBegin := binary.BigEndian.Uint32(binCert[tsBeginOff : tsBeginOff+4])
+		tsEnd := binary.BigEndian.Uint32(binCert[tsEndOff : tsEndOff+4])
 		if tsBegin >= tsEnd {
-			dlog.Warnf("[%v] certificate ends before it starts (%v >= %v)", *serverName, tsBegin, tsEnd)
+			dlog.Warnf("[%v] certificate has invalid time range: start >= end (%v >= %v)", *serverName, tsBegin, tsEnd)
 			continue
 		}
 		ttl := tsEnd - tsBegin
@@ -136,9 +175,6 @@ func FetchCurrentDNSCryptCert(
 			} else {
 				dlog.Debugf("[%v] certificate still valid for %d days", *serverName, daysLeft)
 			}
-			certInfo.ForwardSecurity = false
-		} else {
-			certInfo.ForwardSecurity = true
 		}
 		if !proxy.certIgnoreTimestamp {
 			if now > tsEnd || now < tsBegin {
@@ -153,7 +189,7 @@ func FetchCurrentDNSCryptCert(
 			}
 		}
 		if serial < highestSerial {
-			dlog.Debugf("[%v] Superseded by a previous certificate", *serverName)
+			dlog.Debugf("[%v] Superseded by a more recent certificate", *serverName)
 			continue
 		}
 		if serial == highestSerial {
@@ -164,18 +200,30 @@ func FetchCurrentDNSCryptCert(
 				dlog.Debugf("[%v] Upgrading the construction from %v to %v", *serverName, certInfo.CryptoConstruction, cryptoConstruction)
 			}
 		}
-		if cryptoConstruction != XChacha20Poly1305 && cryptoConstruction != XSalsa20Poly1305 {
+		if cryptoConstruction != XChacha20Poly1305 && cryptoConstruction != XSalsa20Poly1305 &&
+			cryptoConstruction != XWingPQ {
 			dlog.Noticef("[%v] Cryptographic construction %v not supported", *serverName, cryptoConstruction)
 			continue
 		}
-		var serverPk [32]byte
-		copy(serverPk[:], binCert[72:104])
-		sharedKey := ComputeSharedKey(cryptoConstruction, &proxy.proxySecretKey, &serverPk, &providerName)
-		certInfo.SharedKey = sharedKey
+		certInfo.ForwardSecurity = ttl <= 86400*7
+		if isPQ {
+			certInfo.PqPublicKey = append([]byte(nil), binCert[72:1288]...)
+			certInfo.PqCertContext = pqCertContext(binCert)
+			certInfo.ServerPk = [32]byte{}
+			certInfo.SharedKey = [32]byte{}
+			copy(certInfo.MagicQuery[:], binCert[1288:1296])
+		} else {
+			var serverPk [32]byte
+			copy(serverPk[:], binCert[72:104])
+			sharedKey := proxy.computeSharedKey(cryptoConstruction, &serverPk, &providerName)
+			certInfo.SharedKey = sharedKey
+			certInfo.PqPublicKey = nil
+			certInfo.PqCertContext = nil
+			copy(certInfo.ServerPk[:], serverPk[:])
+			copy(certInfo.MagicQuery[:], binCert[104:112])
+		}
 		highestSerial = serial
 		certInfo.CryptoConstruction = cryptoConstruction
-		copy(certInfo.ServerPk[:], serverPk[:])
-		copy(certInfo.MagicQuery[:], binCert[104:112])
 		if isNew {
 			dlog.Noticef("[%s] OK (DNSCrypt) - rtt: %dms%s", *serverName, rtt.Nanoseconds()/1000000, certCountStr)
 		} else {

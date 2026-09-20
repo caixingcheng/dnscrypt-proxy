@@ -1,8 +1,8 @@
 package main
 
 import (
+	"codeberg.org/miekg/dns"
 	"github.com/jedisct1/dlog"
-	"github.com/miekg/dns"
 )
 
 type PluginCaptivePortal struct {
@@ -14,7 +14,7 @@ func (plugin *PluginCaptivePortal) Name() string {
 }
 
 func (plugin *PluginCaptivePortal) Description() string {
-	return "Handle test queries operating systems make to detect Wi-Fi captive portal"
+	return "Handle test queries that operating systems make to detect Wi-Fi captive portals"
 }
 
 func (plugin *PluginCaptivePortal) Init(proxy *Proxy) error {

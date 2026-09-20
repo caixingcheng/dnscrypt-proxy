@@ -26,16 +26,16 @@ type PatternMatcher struct {
 	suffixes     *critbitgo.Trie
 	substrings   []string
 	patterns     []string
-	exact        map[string]interface{}
-	indirectVals map[string]interface{}
+	exact        map[string]any
+	indirectVals map[string]any
 }
 
 func NewPatternMatcher() *PatternMatcher {
 	patternMatcher := PatternMatcher{
 		prefixes:     critbitgo.NewTrie(),
 		suffixes:     critbitgo.NewTrie(),
-		exact:        make(map[string]interface{}),
-		indirectVals: make(map[string]interface{}),
+		exact:        make(map[string]any),
+		indirectVals: make(map[string]any),
 	}
 	return &patternMatcher
 }
@@ -51,7 +51,7 @@ func isGlobCandidate(str string) bool {
 	return false
 }
 
-func (patternMatcher *PatternMatcher) Add(pattern string, val interface{}, position int) error {
+func (patternMatcher *PatternMatcher) Add(pattern string, val any, position int) error {
 	// Determine pattern type based on wildcards and special characters
 	leadingStar := strings.HasPrefix(pattern, "*")
 	trailingStar := strings.HasSuffix(pattern, "*")
@@ -95,21 +95,17 @@ func (patternMatcher *PatternMatcher) Add(pattern string, val interface{}, posit
 		pattern = strings.TrimPrefix(pattern, ".") // Remove leading dot if present
 	}
 	if len(pattern) == 0 {
-		dlog.Errorf("Syntax error in the rule file at line %d", position)
+		return fmt.Errorf("Syntax error in the rule file at line %d", position)
 	}
 
 	pattern = strings.ToLower(pattern)
 	switch patternType {
 	case PatternTypeSubstring:
 		patternMatcher.substrings = append(patternMatcher.substrings, pattern)
-		if val != nil {
-			patternMatcher.indirectVals[pattern] = val
-		}
+		patternMatcher.indirectVals[pattern] = val
 	case PatternTypePattern:
 		patternMatcher.patterns = append(patternMatcher.patterns, pattern)
-		if val != nil {
-			patternMatcher.indirectVals[pattern] = val
-		}
+		patternMatcher.indirectVals[pattern] = val
 	case PatternTypePrefix:
 		patternMatcher.prefixes.Insert([]byte(pattern), val)
 	case PatternTypeSuffix:
@@ -122,12 +118,12 @@ func (patternMatcher *PatternMatcher) Add(pattern string, val interface{}, posit
 	return nil
 }
 
-func (patternMatcher *PatternMatcher) Eval(qName string) (reject bool, reason string, val interface{}) {
+func (patternMatcher *PatternMatcher) Eval(qName string) (reject bool, reason string, val any) {
 	if len(qName) < 2 {
 		return false, "", nil
 	}
 
-	if xval := patternMatcher.exact[qName]; xval != nil {
+	if xval, found := patternMatcher.exact[qName]; found {
 		return true, qName, xval
 	}
 
@@ -139,9 +135,9 @@ func (patternMatcher *PatternMatcher) Eval(qName string) (reject bool, reason st
 		if len(match) < len(revQname) && len(revQname) > 0 {
 			if i := strings.LastIndex(revQname, "."); i > 0 {
 				pName := revQname[:i]
-				if match, _, found := patternMatcher.suffixes.LongestPrefix([]byte(pName)); found {
+				if match, xval2, found := patternMatcher.suffixes.LongestPrefix([]byte(pName)); found {
 					if len(match) == len(pName) || pName[len(match)] == '.' {
-						return true, "*." + StringReverse(string(match)), xval
+						return true, "*." + StringReverse(string(match)), xval2
 					}
 				}
 			}
