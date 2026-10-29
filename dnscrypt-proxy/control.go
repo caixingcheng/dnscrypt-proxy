@@ -2,10 +2,16 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"codeberg.org/miekg/dns"
@@ -27,13 +33,16 @@ import (
 //	dnscrypt-proxy -config <file> -flush <name>[,<type>]
 //
 // Replies are "ok <removed entries>" or "error <reason>". There is no
-// authentication, so access control is left to where it listens: an address
-// starting with "/" is a unix socket, made readable and writable by its owner
-// only; anything else is a TCP address and should be a loopback one.
+// authentication: the channel is only ever a unix socket (control_socket),
+// readable and writable by its owner only.
 
 const (
 	controlReadTimeout = 2 * time.Second
 	controlMaxLine     = 512
+	controlMaxConns    = 4
+	// How long a flush keeps requests that started before it from writing the
+	// flushed name back into the cache. Far longer than any request lives.
+	flushFenceTTL = time.Minute
 )
 
 // The same set unbound-control's "flush" removes.
@@ -42,12 +51,13 @@ var controlFlushTypes = []uint16{
 	dns.TypeMX, dns.TypePTR, dns.TypeSRV, dns.TypeNAPTR, dns.TypeSVCB, dns.TypeHTTPS, dns.TypeTXT,
 }
 
-func (proxy *Proxy) startControl(address string) error {
-	listener, err := listenControl(address)
+func (proxy *Proxy) startControl(path string) error {
+	listener, err := listenControl(path)
 	if err != nil {
 		return err
 	}
-	dlog.Noticef("Control channel listening on %s", address)
+	dlog.Noticef("Control channel listening on %s", path)
+	slots := make(chan struct{}, controlMaxConns)
 	go func() {
 		for {
 			conn, err := listener.Accept()
@@ -56,31 +66,48 @@ func (proxy *Proxy) startControl(address string) error {
 				time.Sleep(time.Second)
 				continue
 			}
-			go handleControlConn(conn)
+			select {
+			case slots <- struct{}{}:
+				go func() {
+					defer func() { <-slots }()
+					handleControlConn(conn)
+				}()
+			default:
+				conn.Close()
+			}
 		}
 	}()
 	return nil
 }
 
-func listenControl(address string) (net.Listener, error) {
-	if !strings.HasPrefix(address, "/") {
-		return net.Listen("tcp", address)
+func listenControl(path string) (net.Listener, error) {
+	if !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("control_socket must be an absolute path, got [%s]", path)
 	}
-	// A socket left behind by a previous instance that did not exit cleanly
-	// makes the bind fail. Only ever remove a socket, never another file.
-	if fi, err := os.Lstat(address); err == nil {
+	if fi, err := os.Lstat(path); err == nil {
+		// Only ever remove a socket, never another file, and only one that no
+		// running instance answers on: a socket left behind by a process that
+		// did not exit cleanly refuses connections, a live one does not.
 		if fi.Mode()&os.ModeSocket == 0 {
-			return nil, fmt.Errorf("%s exists and is not a socket", address)
+			return nil, fmt.Errorf("%s exists and is not a socket", path)
 		}
-		if err := os.Remove(address); err != nil {
+		conn, err := net.DialTimeout("unix", path, controlReadTimeout)
+		if err == nil {
+			conn.Close()
+			return nil, fmt.Errorf("%s is in use by another process", path)
+		}
+		if !errors.Is(err, syscall.ECONNREFUSED) {
+			return nil, err
+		}
+		if err := os.Remove(path); err != nil {
 			return nil, err
 		}
 	}
-	listener, err := net.Listen("unix", address)
+	listener, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(address, 0o600); err != nil {
+	if err := os.Chmod(path, 0o600); err != nil {
 		listener.Close()
 		return nil, err
 	}
@@ -90,27 +117,45 @@ func listenControl(address string) (net.Listener, error) {
 func handleControlConn(conn net.Conn) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(controlReadTimeout))
-	reader := bufio.NewReaderSize(conn, controlMaxLine)
-	line, err := reader.ReadString('\n')
-	if err != nil && len(line) == 0 {
+	reply, err := readControlLine(conn)
+	if err == nil {
+		reply = runControlCommand(reply)
+	} else if errors.Is(err, errControlLineTooLong) {
+		reply = "error line too long"
+	} else {
 		return
 	}
-	fmt.Fprintf(conn, "%s\n", runControlCommand(strings.TrimSpace(line)))
+	fmt.Fprintf(conn, "%s\n", reply)
+}
+
+var errControlLineTooLong = errors.New("line too long")
+
+// readControlLine reads one line of at most controlMaxLine bytes. Nothing past
+// that is ever read, whatever the client sends.
+func readControlLine(r io.Reader) (string, error) {
+	line, err := bufio.NewReader(io.LimitReader(r, controlMaxLine+1)).ReadString('\n')
+	if len(line) > controlMaxLine {
+		return "", errControlLineTooLong
+	}
+	if err != nil && len(line) == 0 {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
 }
 
 // Flush implements the -flush command line switch: it asks the running proxy,
-// through its control channel, to drop "<name>" or "<name>,<type>" from the
+// through its control socket, to drop "<name>" or "<name>,<type>" from the
 // cache, prints the reply and returns the exit code.
-func Flush(address string, arg string) int {
-	if address == "" {
-		fmt.Fprintln(os.Stderr, "control_listen_address is not set in the configuration file")
+func Flush(path string, arg string) int {
+	if path == "" {
+		fmt.Fprintln(os.Stderr, "control_socket is not set in the configuration file")
 		return 1
 	}
 	command := "flush " + arg
 	if name, qtype, found := strings.Cut(arg, ","); found {
 		command = "flush_type " + strings.TrimSpace(name) + " " + strings.TrimSpace(qtype)
 	}
-	reply, err := sendControlCommand(address, command)
+	reply, err := sendControlCommand(path, command)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -122,12 +167,8 @@ func Flush(address string, arg string) int {
 	return 0
 }
 
-func sendControlCommand(address string, command string) (string, error) {
-	network := "tcp"
-	if strings.HasPrefix(address, "/") {
-		network = "unix"
-	}
-	conn, err := net.DialTimeout(network, address, controlReadTimeout)
+func sendControlCommand(path string, command string) (string, error) {
+	conn, err := net.DialTimeout("unix", path, controlReadTimeout)
 	if err != nil {
 		return "", err
 	}
@@ -136,11 +177,7 @@ func sendControlCommand(address string, command string) (string, error) {
 	if _, err := fmt.Fprintf(conn, "%s\n", command); err != nil {
 		return "", err
 	}
-	reply, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil && len(reply) == 0 {
-		return "", err
-	}
-	return strings.TrimSpace(reply), nil
+	return readControlLine(conn)
 }
 
 func runControlCommand(line string) string {
@@ -180,13 +217,62 @@ func flushCachedName(name string, qtypes []uint16) int {
 	if !strings.HasSuffix(qname, ".") {
 		qname += "."
 	}
+	now := time.Now()
 	removed := 0
 	for _, qtype := range qtypes {
 		for flags := byte(0); flags < 4; flags++ {
-			if _, ok := cachedResponses.Remove(cacheKey(qtype, dns.ClassINET, flags, qname)); ok {
+			key := cacheKey(qtype, dns.ClassINET, flags, qname)
+			flushFences.set(key, now)
+			if _, ok := cachedResponses.Remove(key); ok {
 				removed++
 			}
 		}
 	}
 	return removed
+}
+
+// flushFences remembers when each key was last flushed. A request that was
+// already in flight when its name was flushed may still hold the stale entry
+// it found, and serves that entry when the upstream fails; the response
+// plugins would then cache it again as fresh, undoing the flush. The cache
+// asks writtenBeforeFlush and skips such a write.
+var flushFences fenceSet
+
+type fenceSet struct {
+	mu    sync.Mutex
+	at    map[[32]byte]time.Time
+	count atomic.Int32 // lets the cache skip the lock when nothing was flushed
+}
+
+func (f *fenceSet) set(key [32]byte, t time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.at == nil {
+		f.at = make(map[[32]byte]time.Time)
+	}
+	for k, v := range f.at {
+		if t.Sub(v) > flushFenceTTL {
+			delete(f.at, k)
+		}
+	}
+	f.at[key] = t
+	f.count.Store(int32(len(f.at)))
+}
+
+func (f *fenceSet) reset() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.at = nil
+	f.count.Store(0)
+}
+
+// writtenBeforeFlush reports whether key was flushed after requestStart.
+func (f *fenceSet) writtenBeforeFlush(key [32]byte, requestStart time.Time) bool {
+	if f.count.Load() == 0 {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	flushed, ok := f.at[key]
+	return ok && requestStart.Before(flushed)
 }

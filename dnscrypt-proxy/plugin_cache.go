@@ -152,6 +152,9 @@ func (plugin *PluginCacheResponse) Eval(pluginsState *PluginsState, msg *dns.Msg
 		return nil
 	}
 	cacheKey := computeCacheKey(pluginsState, msg)
+	if flushFences.writtenBeforeFlush(cacheKey, pluginsState.requestStart) {
+		return nil
+	}
 	ttl := getMinTTL(
 		msg,
 		pluginsState.cacheMinTTL,
