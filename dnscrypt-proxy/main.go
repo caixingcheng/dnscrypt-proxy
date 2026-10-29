@@ -40,6 +40,7 @@ func main() {
 	version := flag.Bool("version", false, "print current proxy version")
 	flags := ConfigFlags{}
 	flags.Resolve = flag.String("resolve", "", "resolve a DNS name (string can be <name> or <name>,<resolver address>)")
+	flags.Flush = flag.String("flush", "", "drop a name from the cache of the running proxy, through control_listen_address (string can be <name> or <name>,<type>)")
 	flags.List = flag.Bool("list", false, "print the list of available resolvers for the enabled filters")
 	flags.ListAll = flag.Bool("list-all", false, "print the complete list of available resolvers, ignoring filters")
 	flags.IncludeRelays = flag.Bool("include-relays", false, "include the list of available relays in the output of -list and -list-all")

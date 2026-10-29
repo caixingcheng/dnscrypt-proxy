@@ -208,6 +208,7 @@ func configureServerParams(proxy *Proxy, config *Config) {
 	proxy.pqDNSCrypt = config.PQDNSCrypt
 	proxy.ephemeralKeys = config.EphemeralKeys
 	proxy.monitoringUI = config.MonitoringUI
+	proxy.controlListenAddress = config.ControlListenAddress
 }
 
 // configureLoadBalancing - Configures load balancing strategy

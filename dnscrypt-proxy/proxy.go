@@ -38,6 +38,7 @@ type Proxy struct {
 	localDoHListenAddresses  []string
 	monitoringUI             MonitoringUIConfig
 	monitoringInstance       *MonitoringUI
+	controlListenAddress     string
 	xTransport               *XTransport
 	allWeeklyRanges          *map[string]WeeklyRanges
 	routes                   *map[string][]string
@@ -282,6 +283,12 @@ func (proxy *Proxy) StartProxy() {
 		dlog.Fatal(err)
 	}
 	go proxy.netMonitor.start(context.Background(), defaultNetworkMonitorInterval)
+
+	if proxy.controlListenAddress != "" {
+		if err := proxy.startControl(proxy.controlListenAddress); err != nil {
+			dlog.Errorf("Failed to start the control channel on %s: %v", proxy.controlListenAddress, err)
+		}
+	}
 
 	// Initialize and start the monitoring UI if enabled
 	if proxy.monitoringUI.Enabled {
