@@ -225,12 +225,7 @@ func TestControlConnectionCap(t *testing.T) {
 	}
 }
 
-// A request that found a stale entry before the flush serves it when the
-// upstream fails; the response plugins must not write it back as fresh.
-func TestFlushFenceStopsInFlightRewrite(t *testing.T) {
-	resetControlState(t)
-	const qname = "firewalla.encipher.io."
-
+func seedStaleAnswer(qname string) *dns.Msg {
 	answer := new(dns.Msg)
 	answer.Rcode = dns.RcodeSuccess
 	answer.Answer = []dns.RR{&dns.A{
@@ -239,20 +234,37 @@ func TestFlushFenceStopsInFlightRewrite(t *testing.T) {
 	}}
 	cachedResponses.Insert(cacheKey(dns.TypeA, dns.ClassINET, 0, qname),
 		CachedResponse{expiration: time.Now().Add(-time.Minute), msg: answer})
+	return answer
+}
 
-	newState := func(start time.Time) *PluginsState {
-		return &PluginsState{requestStart: start, sessionData: map[string]any{}, cacheMinTTL: 2400, cacheMaxTTL: 86400, cacheNegMinTTL: 60, cacheNegMaxTTL: 600}
-	}
+func newRequestState(start time.Time) *PluginsState {
+	return &PluginsState{requestStart: start, sessionData: map[string]any{}, cacheMinTTL: 2400, cacheMaxTTL: 86400, cacheNegMinTTL: 60, cacheNegMaxTTL: 600}
+}
 
-	// the in-flight request: the cache plugin hands it the stale entry
-	inFlight := newState(time.Now())
-	if err := new(PluginCache).Eval(inFlight, dns.NewMsg(qname, dns.TypeA)); err != nil {
+// staleFallback runs the cache plugin for a request starting now and returns
+// the stale entry it keeps as the fallback for an upstream failure
+func staleFallback(t *testing.T, qname string) (*PluginsState, *dns.Msg) {
+	t.Helper()
+	state := newRequestState(time.Now())
+	if err := new(PluginCache).Eval(state, dns.NewMsg(qname, dns.TypeA)); err != nil {
 		t.Fatal(err)
 	}
-	stale, ok := inFlight.sessionData["stale"].(*dns.Msg)
+	stale, ok := state.sessionData["stale"].(*dns.Msg)
 	if !ok {
 		t.Fatal("expected the cache plugin to keep a stale fallback")
 	}
+	return state, stale
+}
+
+// A request that found a stale entry before the flush serves it when the
+// upstream fails; the response plugins must not write it back as fresh.
+func TestFlushFenceStopsInFlightRewrite(t *testing.T) {
+	resetControlState(t)
+	const qname = "firewalla.encipher.io."
+	answer := seedStaleAnswer(qname)
+
+	// the in-flight request: the cache plugin hands it the stale entry
+	inFlight, stale := staleFallback(t, qname)
 
 	time.Sleep(time.Millisecond)
 	if got := runControlCommand("flush " + qname); got != "ok 1" {
@@ -272,7 +284,7 @@ func TestFlushFenceStopsInFlightRewrite(t *testing.T) {
 	fresh := dns.NewMsg(qname, dns.TypeA)
 	fresh.Response = true
 	fresh.Answer = answer.Answer
-	if err := new(PluginCacheResponse).Eval(newState(time.Now()), fresh); err != nil {
+	if err := new(PluginCacheResponse).Eval(newRequestState(time.Now()), fresh); err != nil {
 		t.Fatal(err)
 	}
 	if !cached(qname, dns.TypeA, 0) {
@@ -285,8 +297,8 @@ func TestFlushFencesExpire(t *testing.T) {
 	a := cacheKey(dns.TypeA, dns.ClassINET, 0, "a.example.")
 	b := cacheKey(dns.TypeA, dns.ClassINET, 0, "b.example.")
 	old := time.Now().Add(-2 * flushFenceTTL)
-	flushGuard.flush([][32]byte{a}, old)
-	flushGuard.flush([][32]byte{b}, time.Now())
+	flushGuard.flushedAt = map[[32]byte]time.Time{a: old}
+	flushGuard.flush([][32]byte{b})
 	if !flushGuard.insert(a, old.Add(-time.Second), CachedResponse{msg: new(dns.Msg)}) {
 		t.Fatal("a fence older than flushFenceTTL must be dropped")
 	}
@@ -335,6 +347,49 @@ func TestFlushWaitsForInFlightInsert(t *testing.T) {
 	}
 	if cached(qname, dns.TypeA, 0) {
 		t.Fatal("the entry stored by the in-flight writer survived the flush")
+	}
+}
+
+// A request that starts while a flush waits for the lock, and reads the entry
+// before the flush removes it, must not be able to cache it again afterwards.
+func TestFlushFencesRequestsStartedWhileFlushWaits(t *testing.T) {
+	resetControlState(t)
+	const qname = "firewalla.encipher.io."
+	seedStaleAnswer(qname)
+
+	// another store holds the read lock, so the flush has to wait
+	checked := make(chan struct{})
+	resume := make(chan struct{})
+	testHookBeforeCacheInsert = func() {
+		close(checked)
+		<-resume
+	}
+	defer func() { testHookBeforeCacheInsert = nil }()
+	holder := cacheKey(dns.TypeA, dns.ClassINET, 0, "holder.example.")
+	held := make(chan bool)
+	go func() { held <- flushGuard.insert(holder, time.Now(), CachedResponse{msg: new(dns.Msg)}) }()
+	<-checked
+	testHookBeforeCacheInsert = nil
+
+	flushed := make(chan string)
+	go func() { flushed <- runControlCommand("flush " + qname) }()
+	time.Sleep(50 * time.Millisecond) // the flush is now waiting for the write lock
+
+	// a request that starts during the wait still finds the stale entry
+	waiting, stale := staleFallback(t, qname)
+
+	close(resume)
+	<-held
+	if reply := <-flushed; reply != "ok 1" {
+		t.Fatalf("flush: got %q", reply)
+	}
+
+	// its upstream fails and it serves the stale fallback
+	if err := new(PluginCacheResponse).Eval(waiting, stale); err != nil {
+		t.Fatal(err)
+	}
+	if cached(qname, dns.TypeA, 0) {
+		t.Fatal("a request that read the entry while the flush waited wrote it back")
 	}
 }
 

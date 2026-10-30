@@ -222,7 +222,7 @@ func flushCachedName(name string, qtypes []uint16) int {
 			keys = append(keys, cacheKey(qtype, dns.ClassINET, flags, qname))
 		}
 	}
-	return flushGuard.flush(keys, time.Now())
+	return flushGuard.flush(keys)
 }
 
 // flushGuard keeps a flush from being undone by a request that was already in
@@ -232,9 +232,10 @@ func flushCachedName(name string, qtypes []uint16) int {
 // store a response for a key flushed after the request started.
 //
 // The check and the store must not be split by a flush, so the cache does both
-// under the read lock (insert) and a flush records and removes under the write
+// under the read lock (insert) and a flush removes and records under the write
 // lock: a flush either comes first, and the store sees it, or comes after, and
-// removes what was stored.
+// removes what was stored. The flush time is taken after the removal, so every
+// request that could still have read a removed entry started before it.
 var flushGuard cacheFlushGuard
 
 type cacheFlushGuard struct {
@@ -250,7 +251,7 @@ var testHookBeforeCacheInsert func()
 func (g *cacheFlushGuard) insert(key [32]byte, requestStart time.Time, response CachedResponse) bool {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	if flushed, ok := g.flushedAt[key]; ok && requestStart.Before(flushed) {
+	if flushed, ok := g.flushedAt[key]; ok && !requestStart.After(flushed) {
 		return false
 	}
 	if testHookBeforeCacheInsert != nil {
@@ -260,11 +261,20 @@ func (g *cacheFlushGuard) insert(key [32]byte, requestStart time.Time, response 
 	return true
 }
 
-// flush removes keys from the cache and records now as their flush time.
-// Returns the number of entries removed.
-func (g *cacheFlushGuard) flush(keys [][32]byte, now time.Time) int {
+// flush removes keys from the cache and records their flush time. Returns the
+// number of entries removed.
+func (g *cacheFlushGuard) flush(keys [][32]byte) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	removed := 0
+	for _, key := range keys {
+		if _, ok := cachedResponses.Remove(key); ok {
+			removed++
+		}
+	}
+	// only now: a request that read an entry before it was removed, even one
+	// that started while this flush waited for the lock, started before this
+	now := time.Now()
 	if g.flushedAt == nil {
 		g.flushedAt = make(map[[32]byte]time.Time)
 	}
@@ -273,12 +283,8 @@ func (g *cacheFlushGuard) flush(keys [][32]byte, now time.Time) int {
 			delete(g.flushedAt, k)
 		}
 	}
-	removed := 0
 	for _, key := range keys {
 		g.flushedAt[key] = now
-		if _, ok := cachedResponses.Remove(key); ok {
-			removed++
-		}
 	}
 	return removed
 }
