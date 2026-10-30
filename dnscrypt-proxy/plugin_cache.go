@@ -34,18 +34,26 @@ func initCachedResponses(cacheSize int) error {
 
 func computeCacheKey(pluginsState *PluginsState, msg *dns.Msg) [32]byte {
 	question := msg.Question[0]
-	h := sha512.New512_256()
-	var tmp [5]byte
-	binary.LittleEndian.PutUint16(tmp[0:2], dns.RRToType(question))
-	binary.LittleEndian.PutUint16(tmp[2:4], question.Header().Class)
+	var flags byte
 	if pluginsState.dnssec {
-		tmp[4] = 1
+		flags = 1
 	}
 	if msg.CheckingDisabled {
-		tmp[4] |= 2
+		flags |= 2
 	}
+	return cacheKey(dns.RRToType(question), question.Header().Class, flags, question.Header().Name)
+}
+
+// cacheKey is shared by lookups and by the control interface's flush, so that a
+// flush hits exactly the entries a query would. flags: 1 = DNSSEC, 2 = CD.
+func cacheKey(qtype uint16, qclass uint16, flags byte, qname string) [32]byte {
+	h := sha512.New512_256()
+	var tmp [5]byte
+	binary.LittleEndian.PutUint16(tmp[0:2], qtype)
+	binary.LittleEndian.PutUint16(tmp[2:4], qclass)
+	tmp[4] = flags
 	h.Write(tmp[:])
-	normalizedRawQName := []byte(question.Header().Name)
+	normalizedRawQName := []byte(qname)
 	NormalizeRawQName(&normalizedRawQName)
 	h.Write(normalizedRawQName)
 	var sum [32]byte
@@ -154,7 +162,9 @@ func (plugin *PluginCacheResponse) Eval(pluginsState *PluginsState, msg *dns.Msg
 	expiration := time.Now().Add(ttl)
 	cachedMsg := cloneMsg(msg)
 	cachedMsg.Question = nil
-	cachedResponses.Insert(cacheKey, CachedResponse{expiration: expiration, msg: cachedMsg})
+	if !flushGuard.insert(cacheKey, pluginsState.requestStart, CachedResponse{expiration: expiration, msg: cachedMsg}) {
+		return nil
+	}
 	updateTTL(msg, expiration)
 
 	return nil

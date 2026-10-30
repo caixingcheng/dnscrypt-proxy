@@ -32,6 +32,7 @@ type Config struct {
 	ListenAddresses          []string           `toml:"listen_addresses"`
 	LocalDoH                 LocalDoHConfig     `toml:"local_doh"`
 	MonitoringUI             MonitoringUIConfig `toml:"monitoring_ui"`
+	ControlSocket            string             `toml:"control_socket"`
 	UserName                 string             `toml:"user_name"`
 	ForceTCP                 bool               `toml:"force_tcp"`
 	HTTP3                    bool               `toml:"http3"`
@@ -310,6 +311,7 @@ type CaptivePortalsConfig struct {
 
 type ConfigFlags struct {
 	Resolve                 *string
+	Flush                   *string
 	List                    *bool
 	ListAll                 *bool
 	IncludeRelays           *bool
@@ -360,6 +362,10 @@ func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
 		}
 		Resolve(addr, *flags.Resolve, len(config.ServerNames) == 1)
 		os.Exit(0)
+	}
+
+	if flags.Flush != nil && len(*flags.Flush) > 0 {
+		os.Exit(Flush(config.ControlSocket, *flags.Flush))
 	}
 
 	if err := cdFileDir(foundConfigFile); err != nil {
