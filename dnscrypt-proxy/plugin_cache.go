@@ -152,9 +152,6 @@ func (plugin *PluginCacheResponse) Eval(pluginsState *PluginsState, msg *dns.Msg
 		return nil
 	}
 	cacheKey := computeCacheKey(pluginsState, msg)
-	if flushFences.writtenBeforeFlush(cacheKey, pluginsState.requestStart) {
-		return nil
-	}
 	ttl := getMinTTL(
 		msg,
 		pluginsState.cacheMinTTL,
@@ -165,7 +162,9 @@ func (plugin *PluginCacheResponse) Eval(pluginsState *PluginsState, msg *dns.Msg
 	expiration := time.Now().Add(ttl)
 	cachedMsg := cloneMsg(msg)
 	cachedMsg.Question = nil
-	cachedResponses.Insert(cacheKey, CachedResponse{expiration: expiration, msg: cachedMsg})
+	if !flushGuard.insert(cacheKey, pluginsState.requestStart, CachedResponse{expiration: expiration, msg: cachedMsg}) {
+		return nil
+	}
 	updateTTL(msg, expiration)
 
 	return nil

@@ -21,10 +21,10 @@ func resetControlState(t *testing.T) {
 	if err := initCachedResponses(1024); err != nil {
 		t.Fatal(err)
 	}
-	flushFences.reset()
+	flushGuard.reset()
 	t.Cleanup(func() {
 		cachedResponses = nil
-		flushFences.reset()
+		flushGuard.reset()
 	})
 }
 
@@ -281,16 +281,60 @@ func TestFlushFenceStopsInFlightRewrite(t *testing.T) {
 }
 
 func TestFlushFencesExpire(t *testing.T) {
-	var f fenceSet
-	key := cacheKey(dns.TypeA, dns.ClassINET, 0, "a.example.")
+	resetControlState(t)
+	a := cacheKey(dns.TypeA, dns.ClassINET, 0, "a.example.")
+	b := cacheKey(dns.TypeA, dns.ClassINET, 0, "b.example.")
 	old := time.Now().Add(-2 * flushFenceTTL)
-	f.set(key, old)
-	f.set(cacheKey(dns.TypeA, dns.ClassINET, 0, "b.example."), time.Now())
-	if f.writtenBeforeFlush(key, old.Add(-time.Second)) {
+	flushGuard.flush([][32]byte{a}, old)
+	flushGuard.flush([][32]byte{b}, time.Now())
+	if !flushGuard.insert(a, old.Add(-time.Second), CachedResponse{msg: new(dns.Msg)}) {
 		t.Fatal("a fence older than flushFenceTTL must be dropped")
 	}
-	if n := f.count.Load(); n != 1 {
+	if n := len(flushGuard.flushedAt); n != 1 {
 		t.Fatalf("%d fences left, want 1", n)
+	}
+}
+
+// The fence check and the insert must not be split by a flush: a writer that
+// passed the check before the flush must have its entry removed by it.
+func TestFlushWaitsForInFlightInsert(t *testing.T) {
+	resetControlState(t)
+	const qname = "firewalla.encipher.io."
+	key := cacheKey(dns.TypeA, dns.ClassINET, 0, qname)
+
+	checked := make(chan struct{})
+	resume := make(chan struct{})
+	testHookBeforeCacheInsert = func() {
+		close(checked)
+		<-resume
+	}
+	defer func() { testHookBeforeCacheInsert = nil }()
+
+	// a request that started before the flush, paused between check and insert
+	inserted := make(chan bool)
+	go func() {
+		inserted <- flushGuard.insert(key, time.Now(), CachedResponse{expiration: time.Now().Add(time.Hour), msg: new(dns.Msg)})
+	}()
+	<-checked
+	testHookBeforeCacheInsert = nil
+
+	flushed := make(chan string)
+	go func() { flushed <- runControlCommand("flush " + qname) }()
+	select {
+	case reply := <-flushed:
+		t.Fatalf("flush completed (%q) while a writer was between its check and its insert", reply)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(resume)
+	if !<-inserted {
+		t.Fatal("the writer passed its check, it should have inserted")
+	}
+	if reply := <-flushed; reply != "ok 1" {
+		t.Fatalf("flush: got %q, want it to remove the entry the writer stored", reply)
+	}
+	if cached(qname, dns.TypeA, 0) {
+		t.Fatal("the entry stored by the in-flight writer survived the flush")
 	}
 }
 

@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -217,62 +216,75 @@ func flushCachedName(name string, qtypes []uint16) int {
 	if !strings.HasSuffix(qname, ".") {
 		qname += "."
 	}
-	now := time.Now()
-	removed := 0
+	keys := make([][32]byte, 0, len(qtypes)*4)
 	for _, qtype := range qtypes {
 		for flags := byte(0); flags < 4; flags++ {
-			key := cacheKey(qtype, dns.ClassINET, flags, qname)
-			flushFences.set(key, now)
-			if _, ok := cachedResponses.Remove(key); ok {
-				removed++
-			}
+			keys = append(keys, cacheKey(qtype, dns.ClassINET, flags, qname))
+		}
+	}
+	return flushGuard.flush(keys, time.Now())
+}
+
+// flushGuard keeps a flush from being undone by a request that was already in
+// flight: such a request may hold the stale entry it found and serve it when
+// the upstream fails, and the response plugins would then cache it again as
+// fresh. A flush records when each key was flushed, and the cache does not
+// store a response for a key flushed after the request started.
+//
+// The check and the store must not be split by a flush, so the cache does both
+// under the read lock (insert) and a flush records and removes under the write
+// lock: a flush either comes first, and the store sees it, or comes after, and
+// removes what was stored.
+var flushGuard cacheFlushGuard
+
+type cacheFlushGuard struct {
+	mu        sync.RWMutex
+	flushedAt map[[32]byte]time.Time
+}
+
+// set by tests to pause a store between the check and the insert
+var testHookBeforeCacheInsert func()
+
+// insert stores response under key unless key was flushed after requestStart,
+// and reports whether it did.
+func (g *cacheFlushGuard) insert(key [32]byte, requestStart time.Time, response CachedResponse) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if flushed, ok := g.flushedAt[key]; ok && requestStart.Before(flushed) {
+		return false
+	}
+	if testHookBeforeCacheInsert != nil {
+		testHookBeforeCacheInsert()
+	}
+	cachedResponses.Insert(key, response)
+	return true
+}
+
+// flush removes keys from the cache and records now as their flush time.
+// Returns the number of entries removed.
+func (g *cacheFlushGuard) flush(keys [][32]byte, now time.Time) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.flushedAt == nil {
+		g.flushedAt = make(map[[32]byte]time.Time)
+	}
+	for k, t := range g.flushedAt {
+		if now.Sub(t) > flushFenceTTL {
+			delete(g.flushedAt, k)
+		}
+	}
+	removed := 0
+	for _, key := range keys {
+		g.flushedAt[key] = now
+		if _, ok := cachedResponses.Remove(key); ok {
+			removed++
 		}
 	}
 	return removed
 }
 
-// flushFences remembers when each key was last flushed. A request that was
-// already in flight when its name was flushed may still hold the stale entry
-// it found, and serves that entry when the upstream fails; the response
-// plugins would then cache it again as fresh, undoing the flush. The cache
-// asks writtenBeforeFlush and skips such a write.
-var flushFences fenceSet
-
-type fenceSet struct {
-	mu    sync.Mutex
-	at    map[[32]byte]time.Time
-	count atomic.Int32 // lets the cache skip the lock when nothing was flushed
-}
-
-func (f *fenceSet) set(key [32]byte, t time.Time) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.at == nil {
-		f.at = make(map[[32]byte]time.Time)
-	}
-	for k, v := range f.at {
-		if t.Sub(v) > flushFenceTTL {
-			delete(f.at, k)
-		}
-	}
-	f.at[key] = t
-	f.count.Store(int32(len(f.at)))
-}
-
-func (f *fenceSet) reset() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.at = nil
-	f.count.Store(0)
-}
-
-// writtenBeforeFlush reports whether key was flushed after requestStart.
-func (f *fenceSet) writtenBeforeFlush(key [32]byte, requestStart time.Time) bool {
-	if f.count.Load() == 0 {
-		return false
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	flushed, ok := f.at[key]
-	return ok && requestStart.Before(flushed)
+func (g *cacheFlushGuard) reset() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.flushedAt = nil
 }
